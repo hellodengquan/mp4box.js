@@ -1545,9 +1545,13 @@ export class ISOFile<TSegmentUser = unknown, TSampleUser = unknown> {
     if (!traf) {
       for (let k = 0; k < trak_sgpds.length; k++) {
         if (!trak_sgpds[k].used && trak_sgpds[k].version >= 2) {
+          // A version 2 description not mapped by any sample-to-group box still
+          // applies: its default description covers the samples left unassigned.
           const sample_group_key = trak_sgpds[k].grouping_type + '/0';
-          const sample_group_info = new SampleGroupInfo(trak_sgpds[k].grouping_type, 0);
           if (!trak.sample_groups_info[sample_group_key]) {
+            const sample_group_info = new SampleGroupInfo(trak_sgpds[k].grouping_type, 0);
+            sample_group_info.description = trak_sgpds[k] as Description;
+            sample_group_info.description.used = true;
             trak.sample_groups_info[sample_group_key] = sample_group_info;
           }
         }
@@ -1557,15 +1561,69 @@ export class ISOFile<TSegmentUser = unknown, TSampleUser = unknown> {
         for (let k = 0; k < traf_sgpds.length; k++) {
           if (!traf_sgpds[k].used && traf_sgpds[k].version >= 2) {
             const sample_group_key = traf_sgpds[k].grouping_type + '/0';
-            const sample_group_info = new SampleGroupInfo(traf_sgpds[k].grouping_type, 0);
-            sample_group_info.is_fragment = true;
             if (!traf.sample_groups_info[sample_group_key]) {
+              const sample_group_info = new SampleGroupInfo(traf_sgpds[k].grouping_type, 0);
+              sample_group_info.is_fragment = true;
+              sample_group_info.fragment_description = traf_sgpds[k] as Description;
+              sample_group_info.fragment_description.used = true;
               traf.sample_groups_info[sample_group_key] = sample_group_info;
             }
           }
         }
       }
     }
+  }
+
+  /**
+   * Resolves the group description a `group_description_index` refers to.
+   *
+   * Per ISO/IEC 14496-12 8.9.2.3, the index is 1-based and refers to the
+   * `sgpd` of the track, except when its top 16 bits are set (the value starts
+   * at 0x10001), in which case it refers to the `sgpd` of the current track
+   * fragment. A sample is in no group when its index is 0, or when the
+   * sample-to-group box does not cover it; the default description declared by
+   * the applicable `sgpd` then applies, if any.
+   *
+   * @bundle isofile-sample-processing.js
+   */
+  static resolveSampleGroupDescription(
+    sample_group_info: SampleGroupInfo,
+    group_description_index: number,
+  ): Description['entries'][number] | undefined {
+    if (group_description_index <= 0) {
+      // The default applies to samples the sample-to-group box leaves out.
+      // The current fragment's description box wins over the track's one.
+      for (const description of [
+        sample_group_info.fragment_description,
+        sample_group_info.description,
+      ]) {
+        if (!description || description.version < 2) continue;
+        const declared = description.default_group_description_index;
+        if (!declared) continue;
+        // The default index numbers entries of the box that declares it. When that
+        // box sits in a fragment, writers may flag the index as fragment-local.
+        const index = declared > 0xffff ? declared - 0x10000 : declared;
+        return description.entries[index - 1];
+      }
+      return;
+    }
+    return ISOFile.getSampleGroupDescriptionEntry(sample_group_info, group_description_index);
+  }
+
+  /** @bundle isofile-sample-processing.js */
+  static getSampleGroupDescriptionEntry(
+    sample_group_info: SampleGroupInfo,
+    group_description_index: number,
+  ): Description['entries'][number] | undefined {
+    const is_fragment_index = group_description_index > 0x10000;
+    const description = is_fragment_index
+      ? sample_group_info.fragment_description
+      : sample_group_info.description;
+    if (!description) return;
+    const index =
+      (is_fragment_index ? group_description_index - 0x10000 : group_description_index) - 1;
+    if (index < 0) return;
+    return description.entries[index];
   }
 
   /** @bundle isofile-sample-processing.js */
@@ -1577,54 +1635,38 @@ export class ISOFile<TSegmentUser = unknown, TSampleUser = unknown> {
   ) {
     sample.sample_groups = [];
     for (const k in sample_groups_info) {
+      const sample_group_info = sample_groups_info[k];
       sample.sample_groups[k] = {
-        grouping_type: sample_groups_info[k].grouping_type,
-        grouping_type_parameter: sample_groups_info[k].grouping_type_parameter,
+        grouping_type: sample_group_info.grouping_type,
+        grouping_type_parameter: sample_group_info.grouping_type_parameter,
       };
-      if (sample_number >= sample_groups_info[k].last_sample_in_run) {
-        if (sample_groups_info[k].last_sample_in_run < 0) {
-          sample_groups_info[k].last_sample_in_run = 0;
+      if (sample_group_info.sbgp) {
+        if (sample_number >= sample_group_info.last_sample_in_run) {
+          if (sample_group_info.last_sample_in_run < 0) {
+            sample_group_info.last_sample_in_run = 0;
+          }
+          sample_group_info.entry_index++;
+          if (sample_group_info.entry_index <= sample_group_info.sbgp.entries.length - 1) {
+            sample_group_info.last_sample_in_run +=
+              sample_group_info.sbgp.entries[sample_group_info.entry_index].sample_count;
+          }
         }
-        sample_groups_info[k].entry_index++;
-        if (sample_groups_info[k].entry_index <= sample_groups_info[k].sbgp.entries.length - 1) {
-          sample_groups_info[k].last_sample_in_run +=
-            sample_groups_info[k].sbgp.entries[sample_groups_info[k].entry_index].sample_count;
+        if (sample_group_info.entry_index <= sample_group_info.sbgp.entries.length - 1) {
+          sample.sample_groups[k].group_description_index =
+            sample_group_info.sbgp.entries[sample_group_info.entry_index].group_description_index;
+        } else {
+          // The runs do not cover this sample: the spec has the reader act as if
+          // an extra run with a 0 index existed, i.e. the sample is in no group.
+          sample.sample_groups[k].group_description_index = 0;
         }
-      }
-      if (sample_groups_info[k].entry_index <= sample_groups_info[k].sbgp.entries.length - 1) {
-        sample.sample_groups[k].group_description_index =
-          sample_groups_info[k].sbgp.entries[
-            sample_groups_info[k].entry_index
-          ].group_description_index;
       } else {
-        sample.sample_groups[k].group_description_index = -1; // special value for not defined
+        // No sample-to-group box: the description box's default rule applies.
+        sample.sample_groups[k].group_description_index = 0;
       }
-      if (sample.sample_groups[k].group_description_index !== 0) {
-        let description: Description;
-        if (sample_groups_info[k].fragment_description) {
-          description = sample_groups_info[k].fragment_description;
-        } else {
-          description = sample_groups_info[k].description;
-        }
-        if (sample.sample_groups[k].group_description_index > 0) {
-          let index: number;
-          if (sample.sample_groups[k].group_description_index > 65535) {
-            index = (sample.sample_groups[k].group_description_index >> 16) - 1;
-          } else {
-            index = sample.sample_groups[k].group_description_index - 1;
-          }
-          if (description && index >= 0) {
-            sample.sample_groups[k].description = description.entries[index];
-          }
-        } else {
-          if (description && description.version >= 2) {
-            if (description.default_group_description_index > 0) {
-              sample.sample_groups[k].description =
-                description.entries[description.default_group_description_index - 1];
-            }
-          }
-        }
-      }
+      sample.sample_groups[k].description = ISOFile.resolveSampleGroupDescription(
+        sample_group_info,
+        sample.sample_groups[k].group_description_index,
+      );
     }
   }
 
@@ -1873,7 +1915,7 @@ export class ISOFile<TSegmentUser = unknown, TSampleUser = unknown> {
           }
           traf.sample_number = 0;
           /* process sample groups */
-          if (traf.sbgps.length > 0) {
+          if (traf.sbgps.length > 0 || traf.sgpds.length > 0) {
             ISOFile.initSampleGroups(trak, traf, traf.sbgps, trak.mdia.minf.stbl.sgpds, traf.sgpds);
           }
           let base_data_offset: number;
